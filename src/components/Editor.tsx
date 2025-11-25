@@ -1,14 +1,14 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
-import { useLocalStorage } from '@/hooks/useLocalStorage'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { supabase } from '@/lib/supabase'
 import { Icons } from './Icons'
 import { ThemeToggle } from './ThemeToggle'
 
 interface Message {
   id: string
   content: string
-  createdAt: string
+  created_at: string
 }
 
 interface FileItem {
@@ -16,42 +16,77 @@ interface FileItem {
   name: string
   size: number
   type: string
-  data: string
-  createdAt: string
+  url: string
+  created_at: string
 }
 
 export function Editor() {
   const [text, setText] = useState('')
-  const [messages, setMessages] = useLocalStorage<Message[]>('khos-file-editor-messages', [])
-  const [files, setFiles] = useLocalStorage<FileItem[]>('khos-file-editor-files', [])
+  const [messages, setMessages] = useState<Message[]>([])
+  const [files, setFiles] = useState<FileItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isSyncing, setIsSyncing] = useState(true)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const handleSave = useCallback(() => {
+  // 데이터 불러오기
+  useEffect(() => {
+    loadData()
+  }, [])
+
+  const loadData = async () => {
+    setIsSyncing(true)
+    try {
+      const [messagesRes, filesRes] = await Promise.all([
+        supabase.from('messages').select('*').order('created_at', { ascending: false }),
+        supabase.from('files').select('*').order('created_at', { ascending: false })
+      ])
+
+      if (messagesRes.data) setMessages(messagesRes.data)
+      if (filesRes.data) setFiles(filesRes.data)
+    } catch (error) {
+      console.error('Failed to load data:', error)
+    }
+    setIsSyncing(false)
+  }
+
+  const handleSave = useCallback(async () => {
     if (!text.trim()) return
 
-    const newMessage: Message = {
-      id: crypto.randomUUID(),
-      content: text.trim(),
-      createdAt: new Date().toISOString(),
-    }
+    setIsLoading(true)
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({ content: text.trim() })
+      .select()
+      .single()
 
-    setMessages(prev => [newMessage, ...prev])
-    setText('')
-  }, [text, setMessages])
+    if (data && !error) {
+      setMessages(prev => [data, ...prev])
+      setText('')
+    }
+    setIsLoading(false)
+  }, [text])
 
   const handleReset = () => {
     setText('')
   }
 
-  const handleDeleteMessage = (id: string) => {
-    setMessages(prev => prev.filter(m => m.id !== id))
+  const handleDeleteMessage = async (id: string) => {
+    const { error } = await supabase.from('messages').delete().eq('id', id)
+    if (!error) {
+      setMessages(prev => prev.filter(m => m.id !== id))
+    }
   }
 
-  const handleDeleteAllMessages = () => {
-    if (window.confirm('모든 메시지를 삭제하시겠습니까?')) {
+  const handleDeleteAllMessages = async () => {
+    if (!window.confirm('모든 메시지를 삭제하시겠습니까?')) return
+
+    setIsLoading(true)
+    const ids = messages.map(m => m.id)
+    const { error } = await supabase.from('messages').delete().in('id', ids)
+    if (!error) {
       setMessages([])
     }
+    setIsLoading(false)
   }
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -60,26 +95,42 @@ export function Editor() {
 
     setIsLoading(true)
 
-    const newFiles: FileItem[] = []
-
     for (const file of Array.from(uploadedFiles)) {
-      const reader = new FileReader()
-      const fileData = await new Promise<string>((resolve) => {
-        reader.onload = () => resolve(reader.result as string)
-        reader.readAsDataURL(file)
-      })
+      const fileExt = file.name.split('.').pop()
+      const fileName = `${crypto.randomUUID()}.${fileExt}`
 
-      newFiles.push({
-        id: crypto.randomUUID(),
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        data: fileData,
-        createdAt: new Date().toISOString(),
-      })
+      // Storage에 파일 업로드
+      const { error: uploadError } = await supabase.storage
+        .from('files')
+        .upload(fileName, file)
+
+      if (uploadError) {
+        console.error('Upload error:', uploadError)
+        continue
+      }
+
+      // Public URL 가져오기
+      const { data: urlData } = supabase.storage
+        .from('files')
+        .getPublicUrl(fileName)
+
+      // DB에 파일 정보 저장
+      const { data, error } = await supabase
+        .from('files')
+        .insert({
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          url: urlData.publicUrl
+        })
+        .select()
+        .single()
+
+      if (data && !error) {
+        setFiles(prev => [data, ...prev])
+      }
     }
 
-    setFiles(prev => [...newFiles, ...prev])
     setIsLoading(false)
 
     if (fileInputRef.current) {
@@ -87,20 +138,48 @@ export function Editor() {
     }
   }
 
-  const handleDeleteFile = (id: string) => {
-    setFiles(prev => prev.filter(f => f.id !== id))
+  const handleDeleteFile = async (file: FileItem) => {
+    // URL에서 파일명 추출
+    const fileName = file.url.split('/').pop()
+
+    // Storage에서 삭제
+    if (fileName) {
+      await supabase.storage.from('files').remove([fileName])
+    }
+
+    // DB에서 삭제
+    const { error } = await supabase.from('files').delete().eq('id', file.id)
+    if (!error) {
+      setFiles(prev => prev.filter(f => f.id !== file.id))
+    }
   }
 
-  const handleDeleteAllFiles = () => {
-    if (window.confirm('모든 파일을 삭제하시겠습니까?')) {
+  const handleDeleteAllFiles = async () => {
+    if (!window.confirm('모든 파일을 삭제하시겠습니까?')) return
+
+    setIsLoading(true)
+
+    // Storage에서 모든 파일 삭제
+    const fileNames = files.map(f => f.url.split('/').pop()).filter(Boolean) as string[]
+    if (fileNames.length > 0) {
+      await supabase.storage.from('files').remove(fileNames)
+    }
+
+    // DB에서 삭제
+    const ids = files.map(f => f.id)
+    const { error } = await supabase.from('files').delete().in('id', ids)
+    if (!error) {
       setFiles([])
     }
+
+    setIsLoading(false)
   }
 
   const handleDownloadFile = (file: FileItem) => {
     const link = document.createElement('a')
-    link.href = file.data
+    link.href = file.url
     link.download = file.name
+    link.target = '_blank'
     link.click()
   }
 
@@ -132,7 +211,12 @@ export function Editor() {
               Kho's File Editor
             </h1>
           </div>
-          <ThemeToggle />
+          <div className="flex items-center gap-2">
+            {isSyncing && (
+              <div className="w-4 h-4 border-2 border-sky-500 border-t-transparent rounded-full animate-spin" />
+            )}
+            <ThemeToggle />
+          </div>
         </header>
 
         {/* Editor Card */}
@@ -150,11 +234,11 @@ export function Editor() {
               <Icons.reset className="w-4 h-4" />
               Reset
             </button>
-            <button onClick={handleSave} className="btn btn-primary flex items-center gap-2" disabled={!text.trim()}>
+            <button onClick={handleSave} className="btn btn-primary flex items-center gap-2" disabled={!text.trim() || isLoading}>
               <Icons.save className="w-4 h-4" />
               Save
             </button>
-            <button onClick={handleDeleteAllMessages} className="btn btn-danger flex items-center gap-2" disabled={messages.length === 0}>
+            <button onClick={handleDeleteAllMessages} className="btn btn-danger flex items-center gap-2" disabled={messages.length === 0 || isLoading}>
               <Icons.trash className="w-4 h-4" />
               Delete All
             </button>
@@ -167,9 +251,10 @@ export function Editor() {
                 multiple
                 onChange={handleFileUpload}
                 className="hidden"
+                disabled={isLoading}
               />
             </label>
-            <button onClick={handleDeleteAllFiles} className="btn btn-danger flex items-center gap-2" disabled={files.length === 0}>
+            <button onClick={handleDeleteAllFiles} className="btn btn-danger flex items-center gap-2" disabled={files.length === 0 || isLoading}>
               <Icons.trash className="w-4 h-4" />
               Delete All Files
             </button>
@@ -201,7 +286,7 @@ export function Editor() {
                         {message.content}
                       </p>
                       <p className="text-xs text-slate-400 mt-2">
-                        {formatDate(message.createdAt)}
+                        {formatDate(message.created_at)}
                       </p>
                     </div>
                     <button
@@ -227,7 +312,7 @@ export function Editor() {
           {isLoading && (
             <div className="card p-8 text-center">
               <div className="w-8 h-8 border-2 border-sky-500 border-t-transparent rounded-full animate-spin mx-auto" />
-              <p className="text-slate-400 mt-2">업로드 중...</p>
+              <p className="text-slate-400 mt-2">처리 중...</p>
             </div>
           )}
 
@@ -252,7 +337,7 @@ export function Editor() {
                         {file.name}
                       </p>
                       <p className="text-xs text-slate-400">
-                        {formatFileSize(file.size)} • {formatDate(file.createdAt)}
+                        {formatFileSize(file.size)} • {formatDate(file.created_at)}
                       </p>
                     </div>
                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -263,7 +348,7 @@ export function Editor() {
                         <Icons.download className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDeleteFile(file.id)}
+                        onClick={() => handleDeleteFile(file)}
                         className="p-2 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                       >
                         <Icons.x className="w-4 h-4" />
@@ -278,7 +363,7 @@ export function Editor() {
 
         {/* Footer */}
         <footer className="text-center text-sm text-slate-400 py-4">
-          <p>데이터는 브라우저의 LocalStorage에 저장됩니다</p>
+          <p>클라우드에 동기화되어 모든 기기에서 접근 가능합니다</p>
         </footer>
       </div>
     </div>
